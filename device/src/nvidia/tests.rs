@@ -1021,6 +1021,43 @@ mod tests {
     const A_STATUS: usize = 40;
     const ALLOC_OUTER: usize = 48;
 
+    // The real mapping tests place the host fd in their own reserved SHM window.
+    struct LocalWindow {
+        base: usize,
+        size: u64,
+    }
+    impl crate::shm::WindowPlacer for LocalWindow {
+        fn place(
+            &self,
+            offset: u64,
+            len: u64,
+            fd: RawFd,
+            fd_offset: u64,
+            writable: bool,
+        ) -> crate::error::Result<()> {
+            assert!(len > 0 && offset.checked_add(len).is_some_and(|end| end <= self.size));
+            let prot = libc::PROT_READ | if writable { libc::PROT_WRITE } else { 0 };
+            // SAFETY: the backend owns this reserved range until the test ends.
+            let mapped = unsafe {
+                libc::mmap(
+                    (self.base + offset as usize) as *mut _,
+                    len as usize,
+                    prot,
+                    libc::MAP_SHARED | libc::MAP_FIXED,
+                    fd,
+                    fd_offset as libc::off_t,
+                )
+            };
+            if mapped == libc::MAP_FAILED {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
+        }
+        fn withdraw(&self, _: u64, _: u64) -> crate::error::Result<()> {
+            unreachable!("RM unmap restores the allocator's backing directly")
+        }
+    }
+
     struct Chain {
         be: NvidiaBackend,
         ctl: u64,
@@ -1033,6 +1070,10 @@ mod tests {
             // Not for_test(): its write-combine zone is 16 KiB, and the
             // smallest real mapping here is 64 KiB.
             let mut be = NvidiaBackend::with_default_zones();
+            be.set_window(Box::new(LocalWindow {
+                base: be.shm.base_ptr() as usize,
+                size: be.shm.total_size(),
+            }));
             let req = open_msg(DeviceKind::Ctl);
             let mut resp = vec![0u8; 64];
             be.dispatch(&req, &mut resp);
@@ -1044,6 +1085,12 @@ mod tests {
                 gpu: 0,
                 cookie: 2,
             };
+            // Select the host ABI before the allowlist sees an allocation.
+            c.simple(abi::ioctl::NV_ESC_CHECK_VERSION_STR, 72);
+            assert!(
+                c.be.rmallow.is_some(),
+                "the host release needs an RM allowlist"
+            );
             // The driver always issues these two before allocating a client.
             // Without them the device allocation is refused with
             // NV_ERR_INSUFFICIENT_PERMISSIONS (0x1b).
