@@ -364,6 +364,59 @@ mod tests {
         (be, h)
     }
 
+    #[test]
+    fn failed_window_placements_do_not_consume_space() {
+        struct FailedWindow;
+        impl crate::shm::WindowPlacer for FailedWindow {
+            fn place(&self, _: u64, _: u64, _: RawFd, _: u64, _: bool) -> crate::error::Result<()> {
+                Err(std::io::Error::from_raw_os_error(libc::ENOMEM).into())
+            }
+            fn withdraw(&self, _: u64, _: u64) -> crate::error::Result<()> {
+                unreachable!("no mapping was placed")
+            }
+        }
+        for recorded in [false, true] {
+            for missing in [true, false] {
+                let host = CountingHost::default();
+                let (mut be, h) = backend_on(&host);
+                be.current_handle = h as u32;
+                if !missing {
+                    be.set_window(Box::new(FailedWindow));
+                }
+                let before = be.shm.free_bytes();
+                let mut params = [0u8; 56];
+                params[24..32].copy_from_slice(&4096u64.to_le_bytes());
+                params[48..52].copy_from_slice(&(h as u32).to_le_bytes());
+                for _ in 0..4 {
+                    let mut resp = [0u8; 256];
+                    if recorded {
+                        be.dispatch_map_memory(0, -1, 0, &params, &mut resp);
+                    } else {
+                        be.map_unrecorded(4096, 0, &mut resp);
+                    }
+                    let errno = if missing {
+                        libc::ENOTSUP
+                    } else if recorded {
+                        libc::ENOMEM
+                    } else {
+                        libc::EINVAL
+                    };
+                    assert_eq!(parse_resp(&resp).status, -errno);
+                    assert_eq!(
+                        be.shm.free_bytes(),
+                        before,
+                        "recorded={recorded}, missing={missing}"
+                    );
+                    assert!(be.live_maps.is_empty());
+                    assert!(!be.active_maps.fd_has_mapping(h));
+                    if missing {
+                        assert!(host.calls().is_empty(), "no window must not arm the host");
+                    }
+                }
+            }
+        }
+    }
+
     /// The seam itself: an allocation the guest may make reaches the host
     /// exactly once, through the trait and not around it.
     #[test]
