@@ -67,6 +67,9 @@ pub enum MsgType {
     ///
     /// No payload. The handle in the header is the whole message.
     EventReady = 8,
+    /// Guest → host: the GPU list and the fd-translation table, which do
+    /// not fit one config message. See [`Descriptor`].
+    GetDescriptor = 9,
 }
 
 impl MsgType {
@@ -81,6 +84,7 @@ impl MsgType {
             6 => Self::GetProcFiles,
             7 => Self::GetSysFiles,
             8 => Self::EventReady,
+            9 => Self::GetDescriptor,
             _ => return None,
         })
     }
@@ -315,6 +319,60 @@ pub struct FileEntry {
 }
 
 // ---------------------------------------------------------------------------
+// GET_DESCRIPTOR
+// ---------------------------------------------------------------------------
+
+/// The largest GPU table a [`Descriptor`] carries.
+pub const MAX_GPUS: usize = 8;
+/// The largest fd-translation table a [`Descriptor`] carries.
+pub const MAX_FD_TRANSLATIONS: usize = 16;
+/// Bytes of a GPU's PCI address on the wire, including its NUL.
+pub const PCI_ADDR_LEN: usize = 16;
+
+/// Version stamp at the head of a [`Descriptor`]. Bump the version on any
+/// layout change. The guest driver refuses a version it does not know.
+pub const DESCRIPTOR_VERSION: u32 = 1;
+
+/// One GPU in a [`Descriptor`].
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct DescriptorGpu {
+    /// Directory name under `/proc/driver/nvidia/gpus`, NUL-padded.
+    pub pci_addr: [u8; PCI_ADDR_LEN],
+    /// The `N` in `/dev/nvidiaN`.
+    pub minor: u32,
+}
+
+/// One ioctl whose parameters carry a file descriptor, at a fixed offset.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FdTranslation {
+    /// The ioctl number.
+    pub nr: u32,
+    /// Byte offset of the descriptor in the top-level parameters.
+    pub payload_offset: u32,
+}
+
+/// Response to `MsgType::GetDescriptor`, carrying the GPU list and the
+/// fd-translation table. The struct is bare, with no `MsgHeader`, like the
+/// file streams.
+///
+/// One vhost-user config message carries at most 256 bytes. The control
+/// queue serves responses far larger than this.
+#[repr(C, packed)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Descriptor {
+    /// [`DESCRIPTOR_VERSION`].
+    pub version: u32,
+    /// Valid entries of `gpus`, at most [`MAX_GPUS`].
+    pub num_gpus: u32,
+    /// Valid entries of `fd_translations`, at most [`MAX_FD_TRANSLATIONS`].
+    pub num_fd_translations: u32,
+    pub gpus: [DescriptorGpu; MAX_GPUS],
+    pub fd_translations: [FdTranslation; MAX_FD_TRANSLATIONS],
+}
+
+// ---------------------------------------------------------------------------
 // Size assertions (compile-time, no_std compatible)
 // ---------------------------------------------------------------------------
 //
@@ -329,6 +387,8 @@ const _: () = {
     assert!(size_of::<MmapResp>() == 24);
     assert!(size_of::<MunmapReq>() == 8);
     assert!(size_of::<FileEntry>() == 8);
+    assert!(size_of::<DescriptorGpu>() == 20);
+    assert!(size_of::<Descriptor>() == 12 + 8 * 20 + 16 * 8);
 };
 
 #[cfg(test)]
@@ -386,10 +446,11 @@ mod tests {
             MsgType::GetProcFiles,
             MsgType::GetSysFiles,
             MsgType::EventReady,
+            MsgType::GetDescriptor,
         ] {
             assert_eq!(MsgType::from_u32(t as u32), Some(t));
         }
         assert_eq!(MsgType::from_u32(0), None);
-        assert_eq!(MsgType::from_u32(9), None);
+        assert_eq!(MsgType::from_u32(10), None);
     }
 }

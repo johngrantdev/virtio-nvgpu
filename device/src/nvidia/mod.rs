@@ -280,6 +280,9 @@ pub struct NvidiaBackend {
     /// The render nodes the guest was told of, by the index it opens them by.
     /// `None` until GET_SYS_FILES has answered.
     dri_given: std::cell::RefCell<Option<Vec<DriDevice>>>,
+    /// The GPUs the host driver owns, as the transport found them at startup.
+    /// The descriptor serves this table to the guest.
+    gpu_slots: Vec<DescriptorGpu>,
     /// UVM semaphore pools placed in the aperture. See `aperture.rs`.
     aperture: aperture::Aperture,
     /// Every message this backend has served, by kind.
@@ -372,6 +375,7 @@ impl NvidiaBackend {
             dri_maps: std::collections::HashMap::new(),
             aperture: Default::default(),
             dri_given: Default::default(),
+            gpu_slots: Vec::new(),
             msg_counts: std::collections::BTreeMap::new(),
             live_maps: std::collections::HashMap::new(),
             guards: Default::default(),
@@ -573,6 +577,15 @@ impl NvidiaBackend {
     /// what it is in a backend that has no transport at all.
     pub fn set_guest_ram(&mut self, ram: Box<dyn crate::guestmem::GuestRam>) {
         self.guest_ram = Some(ram);
+    }
+
+    /// The GPUs to serve in the descriptor, as the transport enumerated them.
+    ///
+    /// The table is computed once at startup, so a guest sees the same GPUs
+    /// for the process's lifetime. A fixture transport can serve a table
+    /// without a host driver.
+    pub fn set_gpu_slots(&mut self, slots: Vec<DescriptorGpu>) {
+        self.gpu_slots = slots;
     }
 
     /// How many host descriptors the guest currently holds open.
@@ -803,6 +816,7 @@ impl NvidiaBackend {
                 MsgType::Munmap => "munmap",
                 MsgType::GetProcFiles => "get_proc_files",
                 MsgType::GetSysFiles => "get_sys_files",
+                MsgType::GetDescriptor => "get_descriptor",
                 MsgType::EventReady => "event_ready",
             })
             .or_insert(0) += 1;
@@ -819,6 +833,7 @@ impl NvidiaBackend {
             MsgType::Munmap => self.handle_munmap(payload, resp_buf),
             MsgType::GetProcFiles => self.handle_get_files(FileTree::Proc, resp_buf),
             MsgType::GetSysFiles => self.handle_get_files(FileTree::Sys, resp_buf),
+            MsgType::GetDescriptor => self.handle_descriptor(resp_buf),
             // Host to guest only. A guest that sends one is confused about the
             // direction of the queue, and saying so beats serving it.
             MsgType::EventReady => {
@@ -864,6 +879,7 @@ fn write_struct<T: Copy>(buf: &mut [u8], val: &T) -> usize {
 }
 
 mod aperture;
+mod descriptor;
 mod files;
 pub use files::FileTree;
 mod host;
