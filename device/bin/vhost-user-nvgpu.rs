@@ -32,7 +32,8 @@ use device::virtio::{NUM_QUEUES, QUEUE_SIZE, VIRTIO_ID_GPU_NV, VirtioGpuNvConfig
 use protocol::messages::{MsgHeader, MsgType};
 use std::os::fd::{BorrowedFd, RawFd};
 use vhost::vhost_user::message::{
-    VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
+    VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures, VhostUserShMemConfig,
+    VhostUserVirtioFeatures,
 };
 use vhost::vhost_user::{Backend, VhostUserFrontendReqHandler};
 use vhost_user_backend::{VhostUserBackendMut, VhostUserDaemon, VringRwLock, VringT};
@@ -367,6 +368,12 @@ const EVENT_QUEUE: usize = 1;
 const NV_SHM_ID: u8 = 1;
 /// The UVM aperture, where semaphore pools are placed. See `device/src/nvidia/aperture.rs`.
 const NV_SHM_ID_APERTURE: u8 = 2;
+/// The window's size, `ZoneConfig::default_1gib()`. The region is one GiB of
+/// address space in a memfd and costs no resident memory until mapped. A
+/// short region here is a guest mapping past the end of its own slot.
+const NV_WINDOW_LEN: u64 = 1 << 30;
+/// The aperture's size, `device/src/nvidia/aperture.rs::APERTURE_LEN`.
+const NV_APERTURE_LEN: u64 = 1 << 30;
 
 struct NvGpuBackend {
     nvidia: Arc<Mutex<NvidiaBackend>>,
@@ -568,6 +575,18 @@ impl VhostUserBackendMut for NvGpuBackend {
             // the VMM's address space, not ours.
             | VhostUserProtocolFeatures::BACKEND_REQ
             | VhostUserProtocolFeatures::SHMEM
+    }
+
+    /// The sizes of the two shared-memory regions the guest maps. The entry
+    /// index is the region id, so the array holds gaps. QEMU asks for these
+    /// while it attaches the device, and it fails to realize the device if
+    /// the request errors, which the trait's default does.
+    fn get_shmem_config(&self) -> std::io::Result<VhostUserShMemConfig> {
+        let mut cfg = VhostUserShMemConfig::default();
+        cfg.nregions = NV_SHM_ID_APERTURE as u32 + 1;
+        cfg.memory_sizes[NV_SHM_ID as usize] = NV_WINDOW_LEN;
+        cfg.memory_sizes[NV_SHM_ID_APERTURE as usize] = NV_APERTURE_LEN;
+        Ok(cfg)
     }
 
     fn set_backend_req_fd(&mut self, backend: Backend) {
