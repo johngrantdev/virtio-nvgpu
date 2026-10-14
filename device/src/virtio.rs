@@ -266,15 +266,19 @@ impl VirtioGpuNvConfig {
         }
     }
 
-    /// Serve a config read, clamped to the struct.
+    /// Serve a config read as exactly `size` bytes, zero-filled past the
+    /// struct.
     ///
-    /// A read past the end yields fewer bytes rather than panicking: the guest
-    /// chooses the offset and length, so neither may be trusted to be in range.
+    /// A vhost-user frontend reads a shorter reply as an error. The frontend
+    /// chooses the offset and the size, so a window past the struct answers
+    /// zeros.
     pub fn read(&self, offset: u32, size: u32) -> Vec<u8> {
         let bytes = self.as_bytes();
         let start = (offset as usize).min(bytes.len());
         let end = start.saturating_add(size as usize).min(bytes.len());
-        bytes[start..end].to_vec()
+        let mut out = vec![0u8; size as usize];
+        out[..end - start].copy_from_slice(&bytes[start..end]);
+        out
     }
 }
 
@@ -379,10 +383,33 @@ mod tests {
     }
 
     #[test]
-    fn a_read_past_the_end_is_clamped_rather_than_panicking() {
+    fn a_read_past_the_end_is_zero_filled_to_the_size_asked_for() {
         let cfg = VirtioGpuNvConfig::default();
-        assert_eq!(cfg.read(4012, 64).len(), 12);
-        assert!(cfg.read(99_999, 16).is_empty());
+        assert_eq!(cfg.read(4012, 64).len(), 64);
+        assert_eq!(cfg.read(99_999, 16).len(), 16);
+        assert!(cfg.read(99_999, 16).iter().all(|b| *b == 0));
         assert_eq!(cfg.read(0, 4024).len(), 4024);
+    }
+
+    /// The last of the frontend's 256-byte windows over config; it straddles
+    /// the struct's end.
+    #[test]
+    fn the_last_window_of_a_chunked_fetch_carries_the_fd_translation_table() {
+        let slot = GpuSlot::new("0000:01:00.0", 0, "Model: NVIDIA RTX A2000");
+        let cfg = VirtioGpuNvConfig::new("615.71.09", &[slot], crate::caps::Caps::DEFAULT, 0);
+
+        let window = cfg.read(0xf00, 256);
+        assert_eq!(window.len(), 256, "a short window fails the whole fetch");
+
+        // num_fd_translations sits at 0xf28, i.e. 0x28 into this window.
+        assert_eq!(
+            u32::from_le_bytes(window[0x28..0x2c].try_into().unwrap()),
+            FD_CARRYING_IOCTLS.len() as u32
+        );
+        // fd_translations[0].nr.
+        assert_eq!(
+            u32::from_le_bytes(window[0x30..0x34].try_into().unwrap()),
+            NV_ESC_REGISTER_FD
+        );
     }
 }
