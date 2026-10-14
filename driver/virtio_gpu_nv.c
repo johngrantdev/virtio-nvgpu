@@ -80,6 +80,8 @@ extern struct kset *module_kset;
 #define NVGPU_MSG_GET_SYS_FILES 7
 /* Host → guest, on the event queue: this handle's descriptor is readable. */
 #define NVGPU_MSG_EVENT_READY 8
+/* The GPU and fd-translation tables, served on the control queue. */
+#define NVGPU_MSG_GET_DESCRIPTOR 9
 
 /* "NVAL": opens the allocation-size section of a GET_SYS_FILES response. */
 #define NVGPU_ALLOC_SIZE_MAGIC 0x4e56414cu
@@ -264,23 +266,11 @@ struct nvgpu_proc_file_entry {
    *              content_len bytes of content          */
 } __packed;
 
-/* Per-GPU slot in VMM config space — 476 bytes.
- *
- * info_text was 1060, which made this struct 1088 and the whole config 8912.
- * That cannot be delivered: virtio_pci_modern_dev.c maps the device config
- * capability with PAGE_SIZE as its maximum and silently truncates anything
- * longer ("length > size" -> "length = size"), so every field past 4096 read
- * back out of range and BUG'd in virtio_cread_bytes. The whole config must fit
- * in one page, and 448 bytes leaves room for the ~278 these files actually
- * contain while keeping all eight slots.
- */
-struct virtio_gpu_nv_gpu_slot {
-  char pci_addr[16];    /*    0.. 16  directory name          */
-  __le32 minor;         /*   16.. 20  /dev/nvidia<minor>      */
-  __le32 info_len;      /*   20.. 24  valid bytes in info_text */
-  __le32 padding[1];    /*   24.. 28                          */
-  char info_text[448];  /*   28.. 476 raw information content  */
-} __packed;             /* 476 bytes */
+/* One GPU, in the descriptor the VMM serves over the control queue. */
+struct nvgpu_descriptor_gpu {
+  char pci_addr[16]; /*    0.. 16  directory name      */
+  __le32 minor;      /*   16.. 20  /dev/nvidia<minor>  */
+} __packed;
 
 /* Where one route that registers memory by address keeps its fields. */
 struct nvgpu_osdesc_route {
@@ -321,34 +311,34 @@ struct nvgpu_fd_translation_entry {
 
 /* VMM config space layout */
 struct virtio_gpu_nv_config {
-  char driver_version[32];               /* 0.. 32  */
-  __le32 num_gpus;                       /* 32.. 36 */
-  __le32 caps;                           /* 36.. 40 */
-  __le32 gpu_device_ids[8];              /* 40.. 72 */
-  struct virtio_gpu_nv_gpu_slot gpus[8]; /* 72..    */
-  __le32 num_fd_translations;
+  char driver_version[32]; /* 0.. 32  */
+  __le32 caps;             /* 32.. 36 */
   /*
    * What the backend can do beyond v0.1, as NVGPU_FEATURE_* bits. This field
    * was padding, and a backend from before it sends zero -- which is exactly
    * "none of these", so no version is needed to read it.
    */
-  __le32 features;
+  __le32 features;       /* 36.. 40 */
+  __le64 vram_limit_mib; /* 40.. 48  the VMM's; the guest reads none of it */
+} __packed;
+
+/* GET_DESCRIPTOR response: the GPU and fd-translation tables. The struct
+ * is bare, with no header, like the file streams. The version field tells
+ * the driver whether the layout is one it knows. */
+struct nvgpu_descriptor {
+  __le32 version;
+  __le32 num_gpus;
+  __le32 num_fd_translations;
+  struct nvgpu_descriptor_gpu gpus[8];
   struct nvgpu_fd_translation_entry fd_translations[16];
 } __packed;
 
-static_assert(sizeof(struct virtio_gpu_nv_gpu_slot) == 476,
-              "gpu_slot size mismatch");
-static_assert(sizeof(struct virtio_gpu_nv_config) == 4016,
-              "virtio_gpu_nv_config size mismatch with VMM");
-static_assert(offsetof(struct virtio_gpu_nv_config, num_fd_translations) ==
-                  3880,
-              "fd_translations offset mismatch with VMM");
+#define NVGPU_DESC_VERSION 1
 
-/* The reason every number above is what it is. A guest cannot see past one
- * page of device config, so a layout that does not fit is not a tight fit --
- * it is unreadable. */
-static_assert(sizeof(struct virtio_gpu_nv_config) <= 4096,
-              "config space must fit in one page; see virtio_pci_modern_dev.c");
+static_assert(sizeof(struct virtio_gpu_nv_config) == 48,
+              "virtio_gpu_nv_config size mismatch with VMM");
+static_assert(sizeof(struct nvgpu_descriptor) == 300,
+              "descriptor size mismatch with VMM");
 
 /* ───────── NVIDIA ioctl parameter structs ───────── */
 
@@ -607,10 +597,10 @@ struct nvgpu_device {
    */
   spinlock_t vq_lock;
 
-  /* GPU slots read from config space at probe */
-  struct virtio_gpu_nv_gpu_slot gpu_slots[8];
+  /* GPU slots, from the descriptor fetched at probe */
+  struct nvgpu_descriptor_gpu gpu_slots[8];
 
-  /* FD translation table received from backend */
+  /* FD translation table, from the same descriptor */
   struct nvgpu_fd_translation_entry fd_translations[16];
   /* NVGPU_FEATURE_* the backend published. Zero from a v0.1 backend. */
   u32 features;
@@ -4942,6 +4932,68 @@ static void nvgpu_pci_cleanup(struct nvgpu_device *dev) {
   }
 }
 
+/* ───────── GET_DESCRIPTOR handler (guest side) ─────────────────────────── */
+
+/*
+ * A vhost-user frontend carries at most 256 bytes of config per message,
+ * and one failing window fails the whole fetch, so the GPU table and the
+ * fd-translation table travel on the control queue.
+ */
+static int nvgpu_fetch_descriptor(struct nvgpu_device *dev) {
+  struct nvgpu_msg_hdr *req;
+  struct nvgpu_descriptor *desc;
+  int ret = 0;
+
+  req = kzalloc(sizeof(*req), GFP_KERNEL);
+  desc = kvzalloc(sizeof(*desc), GFP_KERNEL);
+  if (!req || !desc) {
+    kfree(req);
+    kvfree(desc);
+    return -ENOMEM;
+  }
+
+  req->msg_type = cpu_to_le32(NVGPU_MSG_GET_DESCRIPTOR);
+  req->handle = 0;
+  req->status = 0;
+  req->padding = 0;
+
+  ret = nvgpu_send_recv(dev, req, sizeof(*req), desc, sizeof(*desc));
+  if (ret < 0)
+    goto out;
+
+  if (le32_to_cpu(desc->version) != NVGPU_DESC_VERSION) {
+    ret = -EINVAL;
+    goto out;
+  }
+
+  dev->num_gpus = le32_to_cpu(desc->num_gpus);
+  if (dev->num_gpus == 0 || dev->num_gpus > 8) {
+    ret = -EINVAL;
+    goto out;
+  }
+
+  {
+    u32 i;
+    for (i = 0; i < dev->num_gpus; i++) {
+      dev->gpu_slots[i] = desc->gpus[i];
+      /* NUL-terminate before anything logs or compares it. */
+      dev->gpu_slots[i].pci_addr[15] = '\0';
+    }
+  }
+
+  dev->num_fd_translations = le32_to_cpu(desc->num_fd_translations);
+  if (dev->num_fd_translations > 16)
+    dev->num_fd_translations = 16;
+  if (dev->num_fd_translations > 0)
+    memcpy(dev->fd_translations, desc->fd_translations,
+           dev->num_fd_translations * sizeof(dev->fd_translations[0]));
+
+out:
+  kfree(req);
+  kvfree(desc);
+  return ret;
+}
+
 /* ───────── GET_SYS_FILES handler (guest side) ──────────────────────────── */
 
 static int nvgpu_fetch_sys_files(struct nvgpu_device *dev) {
@@ -5560,8 +5612,8 @@ static int nvgpu_probe(struct virtio_device *vdev) {
              "no RM pointer table for host driver %s; controls whose "
              "parameters carry a pointer will be refused\n",
              dev->driver_version);
-  virtio_cread(vdev, struct virtio_gpu_nv_config, num_gpus, &dev->num_gpus);
   virtio_cread(vdev, struct virtio_gpu_nv_config, caps, &dev->caps);
+  virtio_cread(vdev, struct virtio_gpu_nv_config, features, &dev->features);
 
   if (dev->caps == 0) {
     dev->legacy_caps = true;
@@ -5570,49 +5622,31 @@ static int nvgpu_probe(struct virtio_device *vdev) {
   dev_info(&vdev->dev, "virtio-gpu-nv: caps %#x%s\n", dev->caps,
            dev->legacy_caps ? " (backend predates caps; serving all)" : "");
 
-  if (dev->num_gpus == 0 || dev->num_gpus > 248) {
-    dev_err(&vdev->dev, "virtio-gpu-nv: bad num_gpus %u\n", dev->num_gpus);
-    return -EINVAL;
+  /* Ensure virtio is running before messages and device nodes. */
+  virtio_device_ready(vdev);
+
+  /*
+   * Fetch the GPU and fd tables before any device node exists. The driver
+   * rewrites a file descriptor only for an ioctl the table names. Without
+   * the table, a guest fd reaches the backend as a raw number and every
+   * fd-carrying ioctl fails.
+   */
+  ret = nvgpu_fetch_descriptor(dev);
+  if (ret) {
+    dev_err(&vdev->dev, "virtio-gpu-nv: GET_DESCRIPTOR failed: %d\n", ret);
+    return ret;
   }
 
-  /* GPU info records */
   {
-    u32 i;
-    for (i = 0; i < dev->num_gpus && i < 8; i++) {
-      size_t off = offsetof(struct virtio_gpu_nv_config, gpus[i]);
-      virtio_cread_bytes(vdev, off, &dev->gpu_slots[i],
-                         sizeof(dev->gpu_slots[i]));
-
-      /* Safety: ensure pci_addr is NUL-terminated before logging */
-      dev->gpu_slots[i].pci_addr[15] = '\0';
-
-      dev_info(&vdev->dev,
-               "virtio-gpu-nv: GPU%u  pci=%s  minor=%u  info_len=%u\n", i,
-               dev->gpu_slots[i].pci_addr, le32_to_cpu(dev->gpu_slots[i].minor),
-               le32_to_cpu(dev->gpu_slots[i].info_len));
-    }
-  }
-
-  /* FD translation table */
-  virtio_cread(vdev, struct virtio_gpu_nv_config, features, &dev->features);
-  virtio_cread(vdev, struct virtio_gpu_nv_config, num_fd_translations,
-               &dev->num_fd_translations);
-
-  if (dev->num_fd_translations > 16)
-    dev->num_fd_translations = 16;
-
-  if (dev->num_fd_translations > 0) {
-    size_t off = offsetof(struct virtio_gpu_nv_config, fd_translations);
-    virtio_cread_bytes(vdev, off, dev->fd_translations,
-                       dev->num_fd_translations *
-                           sizeof(dev->fd_translations[0]));
+    u32 gi;
+    for (gi = 0; gi < dev->num_gpus; gi++)
+      dev_info(&vdev->dev, "virtio-gpu-nv: GPU%u  pci=%s  minor=%u\n", gi,
+               dev->gpu_slots[gi].pci_addr,
+               le32_to_cpu(dev->gpu_slots[gi].minor));
   }
 
   dev_info(&vdev->dev, "virtio-gpu-nv: %u fd-translation ioctl(s) registered\n",
            dev->num_fd_translations);
-
-  /* Ensure virtio is running before we open devices */
-  virtio_device_ready(vdev);
 
   /* Create device class once */
   nvgpu_class = class_create("nvidia");

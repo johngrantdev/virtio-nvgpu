@@ -152,6 +152,7 @@ mod abi_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::virtio::FD_CARRYING_IOCTLS;
 
     /// A request header. The handle travels here now, not in the payload.
     fn hdr(msg_type: MsgType, handle: u64) -> Vec<u8> {
@@ -2831,5 +2832,61 @@ mod tests {
         assert!(be.set_vram_limit_mib(None).is_ok());
         be.set_host_driver_version(v615()).unwrap();
         assert!(be.set_vram_limit_mib(Some(100)).is_ok());
+    }
+
+    #[test]
+    fn the_descriptor_carries_the_gpus_and_the_fd_table() {
+        let mut be = NvidiaBackend::for_test();
+        let mut first = DescriptorGpu::default();
+        first.pci_addr[..12].copy_from_slice(b"0000:01:00.0");
+        first.minor = 0;
+        let mut second = DescriptorGpu::default();
+        second.pci_addr[..12].copy_from_slice(b"0000:41:00.0");
+        second.minor = 3;
+        be.set_gpu_slots(vec![first, second]);
+
+        let mut resp = vec![0u8; 4096];
+        let n = be.dispatch(&hdr(MsgType::GetDescriptor, 0), &mut resp);
+        assert_eq!(n, size_of::<Descriptor>());
+
+        // The descriptor is packed; every field comes out by value.
+        let d = read_struct::<Descriptor>(&resp, 0);
+        let (version, num_gpus, num_fd) = (d.version, d.num_gpus, d.num_fd_translations);
+        assert_eq!(version, DESCRIPTOR_VERSION);
+        assert_eq!(num_gpus, 2);
+        assert_eq!(num_fd as usize, FD_CARRYING_IOCTLS.len());
+
+        let g0 = d.gpus[0];
+        let g1 = d.gpus[1];
+        let (addr0, minor1) = (g0.pci_addr, g1.minor);
+        assert_eq!(&addr0[..12], b"0000:01:00.0");
+        assert_eq!(minor1, 3);
+
+        let fd0 = d.fd_translations[0];
+        let (nr, payload_offset) = (fd0.nr, fd0.payload_offset);
+        assert_eq!(nr, abi::ioctl::NV_ESC_REGISTER_FD);
+        assert_eq!(payload_offset, 0);
+    }
+
+    /// A count above the table size would point the driver at entries that
+    /// were never written.
+    #[test]
+    fn the_descriptor_truncates_the_gpu_table_and_says_so() {
+        let mut be = NvidiaBackend::for_test();
+        be.set_gpu_slots(
+            (0..12)
+                .map(|i| {
+                    let mut gpu = DescriptorGpu::default();
+                    gpu.minor = i;
+                    gpu
+                })
+                .collect(),
+        );
+
+        let mut resp = vec![0u8; 4096];
+        be.dispatch(&hdr(MsgType::GetDescriptor, 0), &mut resp);
+        let d = read_struct::<Descriptor>(&resp, 0);
+        let num_gpus = d.num_gpus;
+        assert_eq!(num_gpus as usize, MAX_GPUS);
     }
 }

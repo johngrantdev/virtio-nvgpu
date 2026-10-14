@@ -28,76 +28,9 @@ pub const EVENT_QUEUE: usize = 1;
 /// Recommended virtqueue size.
 pub const QUEUE_SIZE: u16 = 256;
 
-/// Longest PCI address the driver will store, including its NUL.
-pub const PCI_ADDR_LEN: usize = 16;
-/// Bytes of `/proc/driver/nvidia/gpus/<addr>/information` carried per GPU.
-///
-/// 448, not the 1060 this began as. A guest maps the virtio-pci device config
-/// capability with PAGE_SIZE as its maximum and silently truncates anything
-/// longer, so a config larger than one page is not a tight fit but an
-/// unreadable one: every field past 4096 read out of range and took the guest
-/// driver down inside `virtio_cread_bytes`. These files hold about 278 bytes.
-pub const INFO_TEXT_LEN: usize = 448;
+pub use protocol::messages::{MAX_FD_TRANSLATIONS, MAX_GPUS, PCI_ADDR_LEN};
 /// Driver version string length in config space, including its NUL.
 pub const DRIVER_VERSION_LEN: usize = 32;
-/// GPU slots in config space. The driver reads at most this many.
-pub const MAX_GPUS: usize = 8;
-/// FD translation entries in config space.
-pub const MAX_FD_TRANSLATIONS: usize = 16;
-
-/// One GPU, as the guest driver reads it.
-///
-/// Mirrors `struct virtio_gpu_nv_gpu_slot`, which the driver asserts is 476
-/// bytes.
-#[derive(Clone, Copy, Debug)]
-#[repr(C, packed)]
-pub struct GpuSlot {
-    /// Directory name under `/proc/driver/nvidia/gpus`, NUL-terminated.
-    pub pci_addr: [u8; PCI_ADDR_LEN],
-    /// The `N` in `/dev/nvidiaN`.
-    pub minor: u32,
-    /// Valid bytes in `info_text`.
-    pub info_len: u32,
-    pub padding: [u32; 1],
-    /// Raw contents of that GPU's `information` file.
-    pub info_text: [u8; INFO_TEXT_LEN],
-}
-
-impl Default for GpuSlot {
-    fn default() -> Self {
-        Self {
-            pci_addr: [0; PCI_ADDR_LEN],
-            minor: 0,
-            info_len: 0,
-            padding: [0; 1],
-            info_text: [0; INFO_TEXT_LEN],
-        }
-    }
-}
-
-impl GpuSlot {
-    /// Build a slot, truncating both strings to what the driver can hold.
-    ///
-    /// Truncating rather than failing is deliberate: a GPU whose information
-    /// text is longer than the window is still a usable GPU, and refusing to
-    /// describe it would take the whole device down over a cosmetic field.
-    pub fn new(pci_addr: &str, minor: u32, info_text: &str) -> Self {
-        let mut slot = Self {
-            minor,
-            ..Default::default()
-        };
-        // Leave room for the NUL the driver writes at the last byte.
-        let addr = pci_addr.as_bytes();
-        let n = addr.len().min(PCI_ADDR_LEN - 1);
-        slot.pci_addr[..n].copy_from_slice(&addr[..n]);
-
-        let info = info_text.as_bytes();
-        let n = info.len().min(INFO_TEXT_LEN);
-        slot.info_text[..n].copy_from_slice(&info[..n]);
-        slot.info_len = n as u32;
-        slot
-    }
-}
 
 use abi::ioctl::{
     NV_ESC_ALLOC_OS_EVENT, NV_ESC_FREE_OS_EVENT, NV_ESC_REGISTER_FD, NV_ESC_RM_ALLOC_MEMORY,
@@ -126,16 +59,6 @@ pub const FD_CARRYING_IOCTLS: &[(u32, u32)] = &[
     (NV_ESC_RM_MAP_MEMORY, 48),
 ];
 
-/// One ioctl the device wants the driver to rewrite file descriptors in.
-#[derive(Clone, Copy, Debug, Default)]
-#[repr(C, packed)]
-pub struct FdTranslation {
-    /// The ioctl number this applies to.
-    pub nr: u32,
-    /// Where in the payload the descriptor sits.
-    pub payload_offset: u32,
-}
-
 /// This backend reads a deep block that holds several segments, one per
 /// pointer inside an RM control's parameters, announced by
 /// `deep_ptr_offset == protocol::segments::SEGMENTED`.
@@ -148,46 +71,31 @@ pub const FEATURE_RMCTRL_SEGMENTS: u32 = 1 << 0;
 
 /// Device configuration space.
 ///
-/// Mirrors `struct virtio_gpu_nv_config` up to 4016 bytes, which the driver
-/// asserts, with `num_fd_translations` at offset 3880. The guest reads no
-/// further: `vram_limit_mib` after it is for the VMM. The whole must fit in
-/// one page.
+/// Mirrors `struct virtio_gpu_nv_config`, 48 bytes. The struct carries only
+/// what the driver wants before the control queue is up: the version it names
+/// the device by, the caps it is served, and this backend's feature bits.
+/// The GPU and fd-translation tables travel in a `MsgType::GetDescriptor`
+/// response.
 ///
-/// This replaced a 24-byte struct whose first field was `num_gpus`. The driver
-/// reads `num_gpus` from offset 32 and rejects zero, so it read past the end of
-/// what the device served, got nothing, and failed to probe with `-EINVAL` --
-/// a device and driver that disagreed about config space while both compiled
-/// cleanly.
+/// `vram_limit_mib` is not read by the guest. It is announced so the VMM can
+/// refuse to start a guest whose backend is not enforcing the limit the VMM
+/// was configured with. A limit is a flag on a process the VMM did not
+/// start, and a missing flag would otherwise be a guest with the whole card.
 #[derive(Clone, Copy, Debug)]
 #[repr(C, packed)]
 pub struct VirtioGpuNvConfig {
     /// Host driver version, NUL-terminated, e.g. `615.71.09`.
     pub driver_version: [u8; DRIVER_VERSION_LEN],
-    /// How many entries of `gpus` are valid. The driver requires 1..=248.
-    pub num_gpus: u32,
     /// What the guest is served, as `crate::caps` bits. Never zero from this
     /// backend: zero is what a backend from before capabilities sends, and a
     /// guest driver treats it as "everything, as before".
     pub caps: u32,
-    /// PCI device id per GPU.
-    pub gpu_device_ids: [u32; MAX_GPUS],
-    pub gpus: [GpuSlot; MAX_GPUS],
-    pub num_fd_translations: u32,
     /// What this backend can do beyond v0.1, as [`FEATURE_RMCTRL_SEGMENTS`]
     /// and the like. This was padding; a backend from before it sent zero,
     /// which reads as "none of these", so the guest needs no version to read
     /// it and the struct's layout does not change.
     pub features: u32,
-    pub fd_translations: [FdTranslation; MAX_FD_TRANSLATIONS],
     /// The video memory limit this backend enforces, in MiB; 0 for none.
-    ///
-    /// Announced so the VMM can refuse to start a guest whose backend is not
-    /// enforcing the limit the VMM was configured with: a limit is a flag on
-    /// a process the VMM did not start, and a missing flag would otherwise be
-    /// a guest with the whole card. Appended, so a backend from before it
-    /// serves 4016 bytes and a VMM reads the absence as 0. The guest driver
-    /// never reads it: a VMM from before it exposes 4016 bytes, and a guest
-    /// read past those BUGs in virtio_cread_bytes.
     pub vram_limit_mib: u64,
 }
 
@@ -195,30 +103,16 @@ impl Default for VirtioGpuNvConfig {
     fn default() -> Self {
         Self {
             driver_version: [0; DRIVER_VERSION_LEN],
-            num_gpus: 0,
             caps: 0,
-            gpu_device_ids: [0; MAX_GPUS],
-            gpus: [GpuSlot::default(); MAX_GPUS],
-            num_fd_translations: 0,
             features: 0,
-            fd_translations: [FdTranslation::default(); MAX_FD_TRANSLATIONS],
             vram_limit_mib: 0,
         }
     }
 }
 
 impl VirtioGpuNvConfig {
-    /// Build config space for a set of host GPUs.
-    ///
-    /// More than [`MAX_GPUS`] are truncated: the driver reads no further, so
-    /// advertising a count it cannot index would point it at slots that were
-    /// never written.
-    pub fn new(
-        driver_version: &str,
-        gpus: &[GpuSlot],
-        caps: crate::caps::Caps,
-        vram_limit_mib: u64,
-    ) -> Self {
+    /// Build config space for a host driver.
+    pub fn new(driver_version: &str, caps: crate::caps::Caps, vram_limit_mib: u64) -> Self {
         let mut cfg = Self::default();
         cfg.caps = caps.bits();
         cfg.vram_limit_mib = vram_limit_mib;
@@ -226,31 +120,6 @@ impl VirtioGpuNvConfig {
         let v = driver_version.as_bytes();
         let n = v.len().min(DRIVER_VERSION_LEN - 1);
         cfg.driver_version[..n].copy_from_slice(&v[..n]);
-
-        let n = gpus.len().min(MAX_GPUS);
-        cfg.gpus[..n].copy_from_slice(&gpus[..n]);
-        cfg.num_gpus = n as u32;
-
-        // Tell the driver which ioctls carry a file descriptor, and where.
-        //
-        // The driver rewrites a descriptor only when the device names its
-        // ioctl here; otherwise it forwards the guest's own fd number, which
-        // means nothing on the host. Publishing none of these is not a
-        // degraded mode -- the backend then sees a raw guest fd where it
-        // expects one of its handles and refuses the call ("bad embedded
-        // handle 9", nvidia-smi reporting "Unable to determine the device
-        // handle for GPU0").
-        //
-        // The list has to agree with the backend's own, in
-        // `nvidia.rs::dispatch_fd_ioctl`, since that is what reads the
-        // rewritten field back out.
-        for (i, (nr, off)) in FD_CARRYING_IOCTLS.iter().enumerate() {
-            cfg.fd_translations[i] = FdTranslation {
-                nr: *nr,
-                payload_offset: *off,
-            };
-        }
-        cfg.num_fd_translations = FD_CARRYING_IOCTLS.len() as u32;
         cfg
     }
 
@@ -291,125 +160,43 @@ mod tests {
     /// stops probing and nothing else says why.
     #[test]
     fn layout_matches_the_guest_driver() {
-        assert_eq!(size_of::<GpuSlot>(), 476, "gpu_slot size mismatch");
-        assert_eq!(size_of::<VirtioGpuNvConfig>(), 4024, "config size mismatch");
-        // Where the guest driver's struct ends; it reads nothing past here.
-        assert_eq!(offset_of!(VirtioGpuNvConfig, vram_limit_mib), 4016);
-        assert_eq!(
-            offset_of!(VirtioGpuNvConfig, num_fd_translations),
-            3880,
-            "fd_translations offset mismatch"
-        );
-    }
-
-    /// The constraint behind every number above: a guest maps device config
-    /// with PAGE_SIZE as its maximum and truncates the rest without saying so,
-    /// so anything past 4096 is not slow or wasteful -- it is unreadable, and
-    /// reading it takes the guest driver down.
-    #[test]
-    fn config_fits_in_one_page() {
-        assert!(
-            size_of::<VirtioGpuNvConfig>() <= 4096,
-            "config is {} bytes; a guest cannot read past 4096",
-            size_of::<VirtioGpuNvConfig>()
-        );
-    }
-
-    /// Every field the driver reads by a fixed offset.
-    #[test]
-    fn field_offsets_are_where_the_driver_reads_them() {
+        assert_eq!(size_of::<VirtioGpuNvConfig>(), 48, "config size mismatch");
         assert_eq!(offset_of!(VirtioGpuNvConfig, driver_version), 0);
-        assert_eq!(offset_of!(VirtioGpuNvConfig, num_gpus), 32);
-        assert_eq!(offset_of!(VirtioGpuNvConfig, caps), 36);
-        assert_eq!(offset_of!(VirtioGpuNvConfig, gpu_device_ids), 40);
-        assert_eq!(offset_of!(VirtioGpuNvConfig, gpus), 72);
-        assert_eq!(offset_of!(GpuSlot, minor), 16);
-        assert_eq!(offset_of!(GpuSlot, info_len), 20);
-        assert_eq!(offset_of!(GpuSlot, info_text), 28);
+        assert_eq!(offset_of!(VirtioGpuNvConfig, caps), 32);
+        assert_eq!(offset_of!(VirtioGpuNvConfig, features), 36);
+        assert_eq!(offset_of!(VirtioGpuNvConfig, vram_limit_mib), 40);
     }
 
-    /// The driver fails probe on num_gpus == 0, so a device that serves a
-    /// default config never comes up. This is what it looked like in a guest.
+    /// The most one vhost-user config message carries is 256 bytes, so a
+    /// config at or under that reaches a guest through any frontend.
     #[test]
-    fn a_default_config_would_be_rejected_by_the_driver() {
-        let cfg = VirtioGpuNvConfig::default();
-        let n = cfg.num_gpus;
-        assert_eq!(n, 0, "a config with no GPUs must not claim any");
+    fn config_fits_one_config_message() {
+        assert!(size_of::<VirtioGpuNvConfig>() <= 256);
     }
 
     #[test]
-    fn one_gpu_is_described_where_the_driver_looks() {
-        let slot = GpuSlot::new("0000:01:00.0", 0, "Model: NVIDIA RTX A2000");
-        let cfg = VirtioGpuNvConfig::new("615.71.09", &[slot], crate::caps::Caps::DEFAULT, 0);
+    fn version_caps_and_features_are_where_the_driver_reads_them() {
+        let cfg = VirtioGpuNvConfig::new("615.71.09", crate::caps::Caps::DEFAULT, 0);
         let bytes = cfg.as_bytes();
-
         assert_eq!(&bytes[0..9], b"615.71.09");
         assert_eq!(
-            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            u32::from_le_bytes(bytes[32..36].try_into().unwrap()),
             crate::caps::Caps::DEFAULT.bits(),
-            "caps at offset 36"
+            "caps at offset 32"
         );
-        assert_eq!(u32::from_le_bytes(bytes[32..36].try_into().unwrap()), 1);
-        assert_eq!(&bytes[72..84], b"0000:01:00.0");
-        // info_len, at slot offset 20 within the slot array at 72.
         assert_eq!(
-            u32::from_le_bytes(bytes[92..96].try_into().unwrap()),
-            "Model: NVIDIA RTX A2000".len() as u32
-        );
-    }
-
-    /// The driver NUL-terminates `pci_addr[15]` itself. A 16-byte address that
-    /// filled the field would lose its last character there, so it is truncated
-    /// to 15 on the way in and the driver's write is a no-op rather than a
-    /// silent corruption.
-    #[test]
-    fn an_over_long_pci_address_keeps_room_for_its_terminator() {
-        let slot = GpuSlot::new("0000:01:00.0:extra", 0, "");
-        assert_eq!(slot.pci_addr[PCI_ADDR_LEN - 1], 0);
-        assert_eq!(&slot.pci_addr[..15], b"0000:01:00.0:ex");
-    }
-
-    #[test]
-    fn more_gpus_than_slots_are_truncated_not_over_claimed() {
-        let many: Vec<_> = (0..12)
-            .map(|i| GpuSlot::new(&format!("0000:0{i}:00.0"), i, ""))
-            .collect();
-        let cfg = VirtioGpuNvConfig::new("615.71.09", &many, crate::caps::Caps::DEFAULT, 0);
-        let n = cfg.num_gpus;
-        assert_eq!(
-            n as usize, MAX_GPUS,
-            "claimed more GPUs than it can describe"
+            u32::from_le_bytes(bytes[36..40].try_into().unwrap()),
+            FEATURE_RMCTRL_SEGMENTS,
+            "features at offset 36"
         );
     }
 
     #[test]
     fn a_read_past_the_end_is_zero_filled_to_the_size_asked_for() {
         let cfg = VirtioGpuNvConfig::default();
-        assert_eq!(cfg.read(4012, 64).len(), 64);
+        assert_eq!(cfg.read(40, 64).len(), 64);
         assert_eq!(cfg.read(99_999, 16).len(), 16);
         assert!(cfg.read(99_999, 16).iter().all(|b| *b == 0));
-        assert_eq!(cfg.read(0, 4024).len(), 4024);
-    }
-
-    /// The last of the frontend's 256-byte windows over config; it straddles
-    /// the struct's end.
-    #[test]
-    fn the_last_window_of_a_chunked_fetch_carries_the_fd_translation_table() {
-        let slot = GpuSlot::new("0000:01:00.0", 0, "Model: NVIDIA RTX A2000");
-        let cfg = VirtioGpuNvConfig::new("615.71.09", &[slot], crate::caps::Caps::DEFAULT, 0);
-
-        let window = cfg.read(0xf00, 256);
-        assert_eq!(window.len(), 256, "a short window fails the whole fetch");
-
-        // num_fd_translations sits at 0xf28, i.e. 0x28 into this window.
-        assert_eq!(
-            u32::from_le_bytes(window[0x28..0x2c].try_into().unwrap()),
-            FD_CARRYING_IOCTLS.len() as u32
-        );
-        // fd_translations[0].nr.
-        assert_eq!(
-            u32::from_le_bytes(window[0x30..0x34].try_into().unwrap()),
-            NV_ESC_REGISTER_FD
-        );
+        assert_eq!(cfg.read(0, 48).len(), 48);
     }
 }

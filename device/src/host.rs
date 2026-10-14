@@ -1,15 +1,14 @@
 //! What this host's NVIDIA driver looks like, as the guest needs to be told.
 //!
-//! The guest driver reads a version string and a GPU table out of config
-//! space, and both are facts about the host: which driver is loaded, which
-//! cards it owns, and what each card's `information` file says. The kernel
+//! The guest driver needs a version string and a GPU table, and both are facts
+//! about the host: which driver is loaded and which cards it owns. The kernel
 //! publishes all of it under `/proc/driver/nvidia`, so this reads it there
 //! rather than inventing it or taking it on a command line.
 //!
 //! Everything is parameterised by a root directory so it can be tested against
 //! a fixture tree. On a real host that root is [`PROC_NVIDIA`].
 
-use crate::virtio::GpuSlot;
+use protocol::messages::{DescriptorGpu, PCI_ADDR_LEN};
 use std::path::Path;
 
 /// Where a loaded NVIDIA kernel module publishes itself.
@@ -40,7 +39,7 @@ pub fn driver_version(root: &Path) -> Option<String> {
 /// The directory name under `gpus/` is the PCI address, and the minor number
 /// is the `N` in `/dev/nvidiaN`. Ordering is by address so the table a guest
 /// sees is stable across reboots; readdir order is not.
-pub fn gpu_slots(root: &Path) -> Vec<GpuSlot> {
+pub fn gpu_slots(root: &Path) -> Vec<DescriptorGpu> {
     let Ok(entries) = std::fs::read_dir(root.join("gpus")) else {
         return Vec::new();
     };
@@ -55,13 +54,18 @@ pub fn gpu_slots(root: &Path) -> Vec<GpuSlot> {
         .iter()
         .enumerate()
         .map(|(minor, addr)| {
-            let info = std::fs::read_to_string(root.join("gpus").join(addr).join("information"))
-                .unwrap_or_default();
+            let mut gpu = DescriptorGpu::default();
+            // Leave one byte spare for the NUL the driver writes last, so
+            // that write never truncates the address.
+            let bytes = addr.as_bytes();
+            let n = bytes.len().min(PCI_ADDR_LEN - 1);
+            gpu.pci_addr[..n].copy_from_slice(&bytes[..n]);
             // The index is the minor only because the kernel numbers
             // /dev/nvidiaN in the same PCI order it lists these directories in.
             // A host where that stops being true needs the minor read from the
             // device node instead, and this is the line that would change.
-            GpuSlot::new(addr, minor as u32, &info)
+            gpu.minor = minor as u32;
+            gpu
         })
         .collect()
 }
@@ -69,7 +73,6 @@ pub fn gpu_slots(root: &Path) -> Vec<GpuSlot> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::virtio::{MAX_GPUS, VirtioGpuNvConfig};
     use std::path::PathBuf;
 
     struct Fixture(PathBuf);
@@ -129,18 +132,13 @@ mod tests {
     }
 
     #[test]
-    fn a_single_gpu_becomes_a_slot_the_driver_can_read() {
-        let f = Fixture::new(&[(
-            "gpus/0000:01:00.0/information",
-            "Model: \t\t NVIDIA RTX A2000\nIRQ:   \t\t 152\n",
-        )]);
+    fn a_single_gpu_becomes_a_slot_the_descriptor_can_carry() {
+        let f = Fixture::new(&[("gpus/0000:01:00.0/information", "Model: X\n")]);
         let slots = gpu_slots(f.path());
         assert_eq!(slots.len(), 1);
         assert_eq!(&slots[0].pci_addr[..12], b"0000:01:00.0");
         let minor = slots[0].minor;
         assert_eq!(minor, 0);
-        let len = slots[0].info_len;
-        assert!(len > 0, "the information text was not carried");
     }
 
     /// readdir order is not sorted, and a guest that sees GPUs in a different
@@ -162,37 +160,13 @@ mod tests {
         assert_eq!(minors, [0, 1, 2]);
     }
 
-    /// An information file longer than the window must not be lost entirely,
-    /// and must not be claimed as longer than it is.
+    /// The guest driver NUL-terminates `pci_addr[15]` itself, so an address
+    /// that filled all 16 bytes would lose its last character there.
     #[test]
-    fn an_over_long_information_file_is_truncated_honestly() {
-        let big = "Model: X\n".repeat(500);
-        let f = Fixture::new(&[("gpus/0000:01:00.0/information", big.as_str())]);
+    fn an_over_long_pci_address_keeps_room_for_its_terminator() {
+        let f = Fixture::new(&[("gpus/0000:01:00.0:extra/information", "")]);
         let slots = gpu_slots(f.path());
-        let len = slots[0].info_len as usize;
-        assert_eq!(len, crate::virtio::INFO_TEXT_LEN);
-        assert_eq!(&slots[0].info_text[..8], b"Model: X");
-    }
-
-    /// The end the whole module exists for: a config a guest driver accepts.
-    #[test]
-    fn discovery_produces_a_config_the_driver_would_accept() {
-        let f = Fixture::new(&[
-            ("version", OPEN_615),
-            ("gpus/0000:01:00.0/information", "Model: NVIDIA RTX A2000\n"),
-        ]);
-        let version = driver_version(f.path()).expect("a version");
-        let cfg = VirtioGpuNvConfig::new(
-            &version,
-            &gpu_slots(f.path()),
-            crate::caps::Caps::DEFAULT,
-            0,
-        );
-        let n = cfg.num_gpus;
-        assert!(
-            n >= 1 && n as usize <= MAX_GPUS,
-            "driver rejects num_gpus={n}"
-        );
-        assert_eq!(&cfg.as_bytes()[0..9], b"615.71.09");
+        assert_eq!(slots[0].pci_addr[PCI_ADDR_LEN - 1], 0);
+        assert_eq!(&slots[0].pci_addr[..15], b"0000:01:00.0:ex");
     }
 }

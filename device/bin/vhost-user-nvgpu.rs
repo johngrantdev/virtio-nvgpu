@@ -9,9 +9,14 @@
 //! ```text
 //! qemu-system-x86_64 \
 //!   -chardev socket,id=nv,path=/tmp/nvgpu.sock \
-//!   -device vhost-user-device-pci,virtio-id=45,num_vqs=1,chardev=nv \
+//!   -device vhost-user-device-pci,virtio-id=45,num_vqs=2,config_size=64,chardev=nv \
 //!   -object memory-backend-memfd,id=mem,size=2G,share=on -numa node,memdev=mem
 //! ```
+//!
+//! `config_size` is 64 because a vhost-user frontend reads at most 256 bytes
+//! of device config per message. The tables that would fill the space travel
+//! in a `GetDescriptor` response. A larger value needs a frontend that
+//! fetches config in windows, because stock QEMU aborts on one.
 //!
 //! Guest memory must be shared (`memory-backend-memfd,share=on`) or the backend
 //! cannot read the request the guest wrote.
@@ -422,6 +427,7 @@ impl NvGpuBackend {
             .map_err(|e| anyhow::anyhow!("refusing to start: {e}"))?;
 
         let nvidia_vram_mib = nvidia.vram_limit_mib();
+        nvidia.set_gpu_slots(gpus);
         Ok(Self {
             nvidia: Arc::new(Mutex::new(nvidia)),
             mem: None,
@@ -429,7 +435,7 @@ impl NvGpuBackend {
             // Phase A forwards ioctls only. nvidia-smi needs no mapping at all
             // -- 100 ioctls and one mmap in the captured trace -- so a guest
             // can enumerate the GPU before the shared window exists.
-            config: VirtioGpuNvConfig::new(&version, &gpus, caps, nvidia_vram_mib),
+            config: VirtioGpuNvConfig::new(&version, caps, nvidia_vram_mib),
             watches: None,
             req: Vec::new(),
             resp: vec![0u8; RESP_MAX],
