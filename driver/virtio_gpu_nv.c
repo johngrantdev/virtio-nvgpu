@@ -68,7 +68,6 @@ extern struct kset *module_kset;
 #define NV_MAJOR 195
 #define NV_CTL_MINOR 255
 #define NV_UVM_MAJOR 237
-#define NV_CAPS_MAJOR 240
 
 /* ───────── Wire protocol constants ───────── */
 
@@ -5704,36 +5703,46 @@ static int nvgpu_probe(struct virtio_device *vdev) {
              MAJOR(dev->modeset_devno), MINOR(dev->modeset_devno));
   }
 
-  /* Register /dev/nvidia-caps/nvidia-cap{1,2} */
-  dev->caps_devno = MKDEV(NV_CAPS_MAJOR, 1);
-  ret = register_chrdev_region(dev->caps_devno, 2, "nvidia-caps");
+  /* Create /proc/driver/nvidia/version */
+  ret = nvgpu_proc_init(dev);
+  if (ret)
+    goto err_uvm_cdev;
+
+  /*
+   * Register /dev/nvidia-caps/nvidia-cap{1,2} on a dynamically allocated
+   * major. Userspace opens these nodes by path, and nvidia-modprobe reads
+   * the major by name from /proc/devices. A fixed number can belong to some
+   * other distro driver. The guest is then left without the device CUDA,
+   * NVENC and the Vulkan loader look for.
+   *
+   * This block sits after proc_init, the last step of probe that can fail.
+   * No error unwind can then skip the caps class and its chrdev region.
+   */
+  ret = alloc_chrdev_region(&dev->caps_devno, 1, 2, "nvidia-caps");
   if (ret) {
     dev_warn(&vdev->dev, "virtio-gpu-nv: cannot register nvidia-caps: %d\n",
              ret);
-    /* non-fatal — continue without caps */
+    /* The device serves a guest without nvidia-caps. */
   } else {
     nvgpu_caps_class = class_create("nvidia-caps");
-    if (!IS_ERR(nvgpu_caps_class)) {
+    if (IS_ERR(nvgpu_caps_class)) {
+      nvgpu_caps_class = NULL;
+    } else {
       nvgpu_caps_class->devnode = nvgpu_caps_devnode;
 
       cdev_init(&dev->cdev_caps, &nvgpu_caps_fops);
       dev->cdev_caps.owner = THIS_MODULE;
-      if (cdev_add(&dev->cdev_caps, MKDEV(NV_CAPS_MAJOR, 1), 2) == 0) {
-        device_create(nvgpu_caps_class, &vdev->dev, MKDEV(NV_CAPS_MAJOR, 1),
-                      NULL, "nvidia-cap1");
-        device_create(nvgpu_caps_class, &vdev->dev, MKDEV(NV_CAPS_MAJOR, 2),
-                      NULL, "nvidia-cap2");
+      if (cdev_add(&dev->cdev_caps, dev->caps_devno, 2) == 0) {
+        device_create(nvgpu_caps_class, &vdev->dev, dev->caps_devno, NULL,
+                      "nvidia-cap1");
+        device_create(nvgpu_caps_class, &vdev->dev,
+                      MKDEV(MAJOR(dev->caps_devno), 2), NULL, "nvidia-cap2");
         dev_info(
             &vdev->dev,
             "virtio-gpu-nv: registered /dev/nvidia-caps/nvidia-cap{1,2}\n");
       }
     }
   }
-
-  /* Create /proc/driver/nvidia/version */
-  ret = nvgpu_proc_init(dev);
-  if (ret)
-    goto err_uvm_cdev;
 
   /*
    * Where device memory will appear. The VMM publishes it as a virtio shared
@@ -5844,12 +5853,15 @@ static void nvgpu_remove(struct virtio_device *vdev) {
 
   /* nvidia-caps cleanup */
   if (nvgpu_caps_class) {
-    device_destroy(nvgpu_caps_class, MKDEV(NV_CAPS_MAJOR, 1));
-    device_destroy(nvgpu_caps_class, MKDEV(NV_CAPS_MAJOR, 2));
+    device_destroy(nvgpu_caps_class, dev->caps_devno);
+    device_destroy(nvgpu_caps_class, MKDEV(MAJOR(dev->caps_devno), 2));
     cdev_del(&dev->cdev_caps);
-    unregister_chrdev_region(MKDEV(NV_CAPS_MAJOR, 1), 2);
     class_destroy(nvgpu_caps_class);
     nvgpu_caps_class = NULL;
+  }
+  if (dev->caps_devno) {
+    unregister_chrdev_region(dev->caps_devno, 2);
+    dev->caps_devno = 0;
   }
 
   if (nvgpu_class) {
