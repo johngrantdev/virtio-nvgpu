@@ -101,8 +101,8 @@ extern struct kset *module_kset;
 
 /* The most runs one registration may describe; the backend holds the same
  * bound. A fully fragmented buffer costs one run per page, so this covers
- * 4 MiB at worst and more when pages coalesce at all. */
-#define NVGPU_MAX_PAGE_RUNS 1024
+ * 128 MiB at worst and more when pages coalesce at all. */
+#define NVGPU_MAX_PAGE_RUNS 32768
 /* And the most pages, which is the backend's 256 MiB. A buffer that
  * coalesces well can be far larger than the run bound suggests. */
 #define NVGPU_MAX_PIN_PAGES (65536)
@@ -2634,7 +2634,9 @@ static long nvgpu_ioctl_register_memory(struct nvgpu_fd *nfd, unsigned int cmd,
     return ret;
 
   req_total = sizeof(*req) + outer_len + params_len + runs_cap;
-  resp_max = sizeof(*resp) + outer_len + params_len + runs_cap;
+  /* The response echoes the parameter blocks with the backend's rewrite of
+   * the address; the runs are the request's alone. */
+  resp_max = sizeof(*resp) + outer_len + params_len;
   req_buf = kvzalloc(req_total, GFP_KERNEL);
   resp_buf = kvzalloc(resp_max, GFP_KERNEL);
   if (!req_buf || !resp_buf) {
