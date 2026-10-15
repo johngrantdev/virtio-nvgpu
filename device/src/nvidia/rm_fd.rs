@@ -432,6 +432,14 @@ impl NvidiaBackend {
         log::debug!("UNMAP_MEMORY: host status=0x{:x}", status);
 
         if status == 0 {
+            // Drop the mapping at the frontend before the extent returns to
+            // its zone. A reused offset would otherwise overlap a mapping the
+            // frontend still holds, and every later map at that offset fails.
+            if let Some(window) = self.window.as_ref() {
+                if let Err(e) = window.withdraw(entry.region.offset, entry.shm_length) {
+                    log::warn!("UNMAP_MEMORY: the window would not give it back: {e}");
+                }
+            }
             // Host unmap succeeded -- restore the SHM backing and return the
             // extent to its zone, so the space can serve a later mapping.
             if let Err(e) = self.shm.free(&entry.region) {
