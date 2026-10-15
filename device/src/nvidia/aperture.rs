@@ -54,13 +54,16 @@ pub struct Aperture {
 impl Aperture {
     /// Check a pool and find it room, without placing it.
     pub fn admit(&self, handle: u64, addr: u64, len: u64) -> std::result::Result<Pool, i32> {
+        // Shape only. Whether the address is one the VMM can map at is a
+        // property of the transport, checked where the transport is known
+        // (see `map_uvm_pool`): a pool served from a backing file needs no
+        // host address at all.
         let page = 4096;
         if len == 0
             || len % page != 0
             || len > POOL_MAX_LEN
             || addr % page != 0
-            || addr < HVA_MIN
-            || addr.checked_add(len).is_none_or(|end| end > HVA_MAX)
+            || addr.checked_add(len).is_none()
         {
             return Err(libc::EINVAL);
         }
@@ -130,6 +133,10 @@ impl NvidiaBackend {
             Ok(fd) => fd,
             Err(_) => return self.write_error_resp(resp_buf, Status::BadHandle, 0, libc::ENOENT),
         };
+        let Some(window) = self.window.as_ref() else {
+            log::warn!("UVM handle {handle}: no transport to place a pool through");
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOTSUP);
+        };
         let pool = match self.aperture.admit(handle, offset, size) {
             Ok(p) => p,
             Err(errno) => {
@@ -139,10 +146,24 @@ impl NvidiaBackend {
                 return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, errno);
             }
         };
-        let Some(window) = self.window.as_ref() else {
-            log::warn!("UVM handle {handle}: no transport to place a pool through");
-            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::ENOTSUP);
-        };
+        // Without a backing file the VMM maps the UVM file at the pool's own
+        // address, so the address has to be one the VMM can leave free. With
+        // one, no mapping ever reaches the pool's address and any of it will
+        // do.
+        if !window.pools_from_backing()
+            && (pool.addr < HVA_MIN
+                || pool
+                    .addr
+                    .checked_add(pool.len)
+                    .is_none_or(|end| end > HVA_MAX))
+        {
+            log::warn!(
+                "UVM handle {handle}: refusing a pool at {:#x}+{:#x}, outside the band a VMM can map",
+                pool.addr,
+                pool.len
+            );
+            return self.write_error_resp(resp_buf, Status::IoctlFailed, 0, libc::EINVAL);
+        }
         if let Err(e) = window.place_pool(pool.offset, pool.len, host_fd, pool.addr) {
             log::warn!(
                 "UVM handle {handle}: the VMM would not place the pool at {:#x}+{:#x}: {e}",
@@ -230,8 +251,6 @@ mod tests {
             (HVA, 4097),
             (HVA + 1, 4096),
             (HVA, POOL_MAX_LEN + 4096),
-            (HVA_MIN - 4096, 4096),
-            (HVA_MAX - 4096, 8192),
             (u64::MAX & !4095, 4096),
         ] {
             assert_eq!(
@@ -240,6 +259,16 @@ mod tests {
                 "{addr:#x}+{len:#x}"
             );
         }
+    }
+
+    #[test]
+    fn any_aligned_host_address_is_admitted() {
+        // Whether a VMM can map at the address is the transport's check,
+        // not this one: a pool served from a backing file is reached by no
+        // host mapping at all.
+        let ap = Aperture::default();
+        assert!(ap.admit(1, 0x7f31d6000000, 2 * MIB).is_ok());
+        assert!(ap.admit(1, 4096, 4096).is_ok());
     }
 
     #[test]
