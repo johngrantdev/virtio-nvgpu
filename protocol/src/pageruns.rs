@@ -30,11 +30,11 @@ pub const PAGE_RUNS: u32 = u32::MAX - 1;
 
 /// The most runs one registration may describe.
 ///
-/// A fully fragmented buffer costs one run per page, so this covers 4 MiB at
-/// worst and more when the pages coalesce at all. The backend holds the same
+/// A fully fragmented buffer costs one run per page, so this covers 128 MiB
+/// at worst and more when pages coalesce at all. The backend holds the same
 /// bound; this one keeps a guest from building a message it will only have
 /// refused.
-pub const MAX_RUNS: usize = 1024;
+pub const MAX_RUNS: usize = 32768;
 
 /// One run: a guest-physical address and a length, both whole pages.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

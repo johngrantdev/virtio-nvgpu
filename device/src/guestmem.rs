@@ -30,12 +30,12 @@ use std::os::fd::{AsRawFd, OwnedFd};
 
 /// The most runs one registration may carry.
 ///
-/// A fully fragmented buffer costs one run per page, so this covers 4 MiB at
-/// worst and any larger buffer that coalesces at all. `cuCtxCreate` registers
-/// 2 MiB, which fits even with every page scattered. A guest that needs more
-/// is refused and logged rather than quietly truncated: the number to raise
-/// this to should come from a real workload, not from a guess.
-pub const MAX_RUNS: usize = 1024;
+/// A fully fragmented buffer costs one run per page, so this covers 128 MiB
+/// at worst and more when pages coalesce at all. `cuCtxCreate` registers
+/// 2 MiB, which fits even with every page scattered. A guest that needs
+/// more is refused and logged rather than quietly truncated, and the number
+/// to raise this to should come from a real workload, not from a guess.
+pub const MAX_RUNS: usize = 32768;
 
 /// The most one registration may cover. Not a security bound -- the per-run
 /// checks are -- but a bound on what one message can be asked to describe.
