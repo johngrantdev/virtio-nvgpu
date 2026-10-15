@@ -20,6 +20,11 @@
 //!
 //! Guest memory must be shared (`memory-backend-memfd,share=on`) or the backend
 //! cannot read the request the guest wrote.
+//!
+//! UVM pool slots reach the guest through a mapping the VMM makes. UVM maps
+//! only at the address equal to the file offset, which a VMM has to place
+//! explicitly and QEMU cannot, so `--pool-backing` names a file the VMM can
+//! map instead. The pools then carry no real UVM content.
 
 use std::collections::HashMap;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -78,6 +83,15 @@ struct Args {
     /// one refuses to start a guest on a backend that is not enforcing it.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     vram_limit_mib: Option<u64>,
+
+    /// A file pool slots are served from, at least 64 MiB, or none to map
+    /// pools from the UVM file itself. UVM maps only at the address equal
+    /// to the offset, which a VMM has to place explicitly and QEMU cannot,
+    /// so a VMM that maps the UVM file nowhere is served from this file
+    /// instead. Pools hold no real UVM content through it. The file must
+    /// exist before the backend starts: the sandbox names it up front.
+    #[arg(long)]
+    pool_backing: Option<PathBuf>,
 }
 
 /// Places device memory through the vhost-user backend request channel.
@@ -115,7 +129,11 @@ impl device::guestmem::GuestRam for VhostGuestRam {
     }
 }
 
-struct VhostWindow(Backend);
+struct VhostWindow {
+    backend: Backend,
+    /// A file pool slots are served from, or none to map the UVM file.
+    pool_backing: Option<PathBuf>,
+}
 
 impl WindowPlacer for VhostWindow {
     fn place(
@@ -141,7 +159,7 @@ impl WindowPlacer for VhostWindow {
         // SAFETY: the descriptor is owned by the handle table for the whole of
         // this call, and is only borrowed to be sent.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        self.0
+        self.backend
             .shmem_map(&req, &borrowed)
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
@@ -156,26 +174,43 @@ impl WindowPlacer for VhostWindow {
             len,
             flags: 0,
         };
-        self.0
+        self.backend
             .shmem_unmap(&req)
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
     }
 
     fn place_pool(&self, offset: u64, len: u64, fd: RawFd, addr: u64) -> device::error::Result<()> {
-        // On the aperture, fd_offset is the pool's host address as well as
-        // its offset in the file: UVM takes the mapping nowhere else.
+        // A backing file carries the slot: pools need no real UVM pages and
+        // a VMM that cannot map the UVM file still serves them. Without one
+        // the UVM file goes up as before, for VMMs that map it.
+        let backing = match self.pool_backing.as_ref() {
+            Some(path) => Some(
+                std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(path)
+                    .map_err(device::error::DeviceError::Io)?,
+            ),
+            None => None,
+        };
+        let (fd, fd_offset) = match backing.as_ref() {
+            Some(file) => (file.as_raw_fd(), 0),
+            None => (fd, addr),
+        };
         let req = VhostUserMMap {
             shmid: NV_SHM_ID_APERTURE,
             padding: [0; 7],
-            fd_offset: addr,
+            fd_offset,
             shm_offset: offset,
             len,
             flags: VhostUserMMapFlags::WRITABLE.bits(),
         };
-        // SAFETY: as in `place`.
+        // SAFETY: the descriptor is owned by the handle table or by
+        // `backing` for the whole of this call, and is only borrowed to be
+        // sent.
         let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-        self.0
+        self.backend
             .shmem_map(&req, &borrowed)
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
@@ -190,10 +225,14 @@ impl WindowPlacer for VhostWindow {
             len,
             flags: 0,
         };
-        self.0
+        self.backend
             .shmem_unmap(&req)
             .map(|_| ())
             .map_err(device::error::DeviceError::Io)
+    }
+
+    fn pools_from_backing(&self) -> bool {
+        self.pool_backing.is_some()
     }
 }
 
@@ -385,6 +424,8 @@ struct NvGpuBackend {
     mem: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
     event_idx: bool,
     config: VirtioGpuNvConfig,
+    /// A file pool slots are served from, or none to map the UVM file.
+    pool_backing: Option<PathBuf>,
     /// Started on the first message, because the event queue and guest memory
     /// are not known before then.
     watches: Option<Sender<Watch>>,
@@ -401,7 +442,12 @@ impl NvGpuBackend {
     /// The guest driver rejects `num_gpus == 0`, so a host with no NVIDIA
     /// module loaded is refused here, where the reason can be stated, rather
     /// than in a guest as a bare -EINVAL from probe.
-    fn new(proc_nvidia: &Path, caps: Caps, vram_limit_mib: Option<u64>) -> anyhow::Result<Self> {
+    fn new(
+        proc_nvidia: &Path,
+        caps: Caps,
+        vram_limit_mib: Option<u64>,
+        pool_backing: Option<PathBuf>,
+    ) -> anyhow::Result<Self> {
         let version = host::driver_version(proc_nvidia).ok_or_else(|| {
             anyhow::anyhow!(
                 "no NVIDIA driver version at {} -- is the kernel module loaded?",
@@ -436,6 +482,7 @@ impl NvGpuBackend {
             // -- 100 ioctls and one mmap in the captured trace -- so a guest
             // can enumerate the GPU before the shared window exists.
             config: VirtioGpuNvConfig::new(&version, caps, nvidia_vram_mib),
+            pool_backing,
             watches: None,
             req: Vec::new(),
             resp: vec![0u8; RESP_MAX],
@@ -597,10 +644,10 @@ impl VhostUserBackendMut for NvGpuBackend {
 
     fn set_backend_req_fd(&mut self, backend: Backend) {
         log::info!("window: request channel open; device memory is now mappable");
-        self.nvidia
-            .lock()
-            .unwrap()
-            .set_window(Box::new(VhostWindow(backend)));
+        self.nvidia.lock().unwrap().set_window(Box::new(VhostWindow {
+            backend,
+            pool_backing: self.pool_backing.clone(),
+        }));
     }
 
     fn get_config(&self, offset: u32, size: u32) -> Vec<u8> {
@@ -693,7 +740,16 @@ fn main() -> anyhow::Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
     let report = device::sandbox::enter(&device::sandbox::Paths {
-        devices: device::sandbox::gpu_nodes(),
+        devices: {
+            let mut d = device::sandbox::gpu_nodes();
+            // Opened read-write when a pool is placed, so it has to be one
+            // path this process may reach. It must exist before the ruleset
+            // is in force, which the unit that starts the backend arranges.
+            if let Some(p) = args.pool_backing.as_ref() {
+                d.push(p.clone());
+            }
+            d
+        },
         read_only: vec![
             args.proc_nvidia.clone(),
             PathBuf::from("/sys/class/drm"),
@@ -704,19 +760,23 @@ fn main() -> anyhow::Result<()> {
     })?;
     log::info!(
         "sandbox: landlock ABI {}, {} seccomp instructions; no path outside the GPU nodes, the \
-         driver's own trees and the socket's directory, no executable mapping, no process, no \
-         socket but AF_UNIX",
+         driver's own trees, the socket's directory and the pool backing file, no executable \
+         mapping, no process, no socket but AF_UNIX",
         report.landlock_abi,
         report.seccomp_rules
     );
 
     log::info!(
-        "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}, {}",
+        "virtio-nvgpu vhost-user backend: device id {VIRTIO_ID_GPU_NV}, socket {}, caps {}, {}{}",
         args.socket,
         args.caps,
         match args.vram_limit_mib {
             Some(m) => format!("video memory limited to {m} MiB"),
             None => "no video memory limit".to_string(),
+        },
+        match args.pool_backing.as_ref() {
+            Some(p) => format!(", pools from {}", p.display()),
+            None => String::new(),
         }
     );
 
@@ -724,6 +784,7 @@ fn main() -> anyhow::Result<()> {
         &args.proc_nvidia,
         args.caps,
         args.vram_limit_mib,
+        args.pool_backing.clone(),
     )?));
     // vhost_user_backend::Error does not implement std::error::Error, so it
     // cannot ride `?` on its own.

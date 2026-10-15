@@ -631,9 +631,11 @@ pub trait WindowPlacer: Send {
     /// access reach no mapping at all in a range the memory slot still covers.
     fn withdraw(&self, shm_offset: u64, len: u64) -> Result<()>;
 
-    /// Have the VMM map `len` bytes of a UVM file at host address `addr`,
-    /// which is also the file offset, and back `offset` within the aperture
-    /// with it. See `nvidia/aperture.rs`. A transport with no aperture says so.
+    /// Have the VMM back `offset` within the aperture with `len` bytes for
+    /// the pool a UVM file maps: from the file at `fd`, offset `addr`, when
+    /// no backing is configured for pools, or from the backing when one is.
+    /// See `nvidia/aperture.rs` and `pools_from_backing`. A transport with
+    /// no aperture says so.
     fn place_pool(&self, offset: u64, len: u64, fd: RawFd, addr: u64) -> Result<()> {
         let _ = (offset, len, fd, addr);
         Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
@@ -643,5 +645,14 @@ pub trait WindowPlacer: Send {
     fn withdraw_pool(&self, offset: u64, len: u64) -> Result<()> {
         let _ = (offset, len);
         Err(std::io::Error::from_raw_os_error(libc::ENOTSUP).into())
+    }
+
+    /// True when pools are served from a backing file rather than the UVM
+    /// file. UVM maps only at the address equal to the file offset, which a
+    /// VMM has to place explicitly and QEMU cannot, so a backing file is
+    /// what serves pools on hosts without such a VMM. The pool's own address
+    /// then reaches no mapping and any aligned address passes.
+    fn pools_from_backing(&self) -> bool {
+        false
     }
 }
