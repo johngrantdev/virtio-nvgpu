@@ -152,6 +152,8 @@ mod abi_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::virtio::FD_CARRYING_IOCTLS;
+    use std::sync::{Arc, Mutex};
 
     /// A request header. The handle travels here now, not in the payload.
     fn hdr(msg_type: MsgType, handle: u64) -> Vec<u8> {
@@ -1078,6 +1080,10 @@ mod tests {
     struct LocalWindow {
         base: usize,
         size: u64,
+        /// Every (offset, len) the placer was told to drop, so a test can
+        /// prove the frontend is told on unmap rather than left holding the
+        /// range.
+        withdraws: Arc<Mutex<Vec<(u64, u64)>>>,
     }
     impl crate::shm::WindowPlacer for LocalWindow {
         fn place(
@@ -1106,8 +1112,17 @@ mod tests {
             }
             Ok(())
         }
-        fn withdraw(&self, _: u64, _: u64) -> crate::error::Result<()> {
-            unreachable!("RM unmap restores the allocator's backing directly")
+        fn withdraw(&self, offset: u64, len: u64) -> crate::error::Result<()> {
+            self.withdraws.lock().unwrap().push((offset, len));
+            // SAFETY: `place` mapped exactly this range over the reserved
+            // base, and the allocator restores its own backing right after.
+            let rc = unsafe {
+                libc::munmap((self.base + offset as usize) as *mut _, len as usize)
+            };
+            if rc != 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            Ok(())
         }
     }
 
@@ -1116,6 +1131,7 @@ mod tests {
         ctl: u64,
         gpu: u64,
         cookie: u64,
+        withdraws: Arc<Mutex<Vec<(u64, u64)>>>,
     }
 
     impl Chain {
@@ -1123,9 +1139,11 @@ mod tests {
             // Not for_test(): its write-combine zone is 16 KiB, and the
             // smallest real mapping here is 64 KiB.
             let mut be = NvidiaBackend::with_default_zones();
+            let withdraws = Arc::new(Mutex::new(Vec::new()));
             be.set_window(Box::new(LocalWindow {
                 base: be.shm.base_ptr() as usize,
                 size: be.shm.total_size(),
+                withdraws: withdraws.clone(),
             }));
             let req = open_msg(DeviceKind::Ctl);
             let mut resp = vec![0u8; 64];
@@ -1137,6 +1155,7 @@ mod tests {
                 ctl,
                 gpu: 0,
                 cookie: 2,
+                withdraws,
             };
             // Select the host ABI before the allowlist sees an allocation.
             c.simple(abi::ioctl::NV_ESC_CHECK_VERSION_STR, 72);
@@ -1472,6 +1491,11 @@ mod tests {
                 "run {i}: closing the fd did not release its mapping"
             );
         }
+        assert_eq!(
+            c.withdraws.lock().unwrap().len(),
+            50,
+            "a closed fd must tell the frontend to drop its mapping"
+        );
         c.be.teardown();
     }
 
@@ -1526,6 +1550,11 @@ mod tests {
         assert_eq!(
             before, after,
             "{cycles} map/unmap cycles did not return every byte to the zones"
+        );
+        assert_eq!(
+            c.withdraws.lock().unwrap().len(),
+            cycles,
+            "every unmap must tell the frontend to drop the mapping"
         );
         assert_eq!(
             handles_before,

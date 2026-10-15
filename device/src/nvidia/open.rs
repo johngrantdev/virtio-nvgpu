@@ -99,6 +99,13 @@ impl NvidiaBackend {
                 entry.region.offset,
                 entry.region.length
             );
+            // The frontend must drop the mapping before the extent returns to
+            // its zone, or a reused offset overlaps a mapping it still holds.
+            if let Some(window) = self.window.as_ref() {
+                if let Err(e) = window.withdraw(entry.region.offset, entry.shm_length) {
+                    log::warn!("close handle={handle}: the window would not give it back: {e}");
+                }
+            }
             if let Err(e) = self.shm.free(&entry.region) {
                 log::warn!("close handle={handle}: SHM free failed: {e}");
             }
